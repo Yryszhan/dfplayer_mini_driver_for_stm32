@@ -1,6 +1,18 @@
 #include "dfplayer.h"
+#include "mic.h"
 
-/* ---- Задержка на SysTick, отдаём её библиотеке ---- */
+/* ---- Настройки детектора ---- */
+#define TRACK_COUNT     4      /* сколько треков на карте */
+#define TRIGGER_MARGIN  400    /* насколько выше тишины считать шумом */
+#define COOLDOWN_MS     500    /* пауза после окончания трека */
+
+/* ---- Для наблюдения в отладчике ---- */
+volatile uint16_t dbg_level    = 0;   /* текущий уровень */
+volatile uint16_t dbg_baseline = 0;   /* уровень тишины */
+volatile uint16_t dbg_peak     = 0;   /* максимум за всё время */
+volatile uint32_t dbg_triggers = 0;   /* сколько раз сработало */
+volatile uint16_t dbg_track    = 0;   /* последний запущенный трек */
+
 static void delay_ms(uint32_t ms)
 {
     while (ms--) {
@@ -10,13 +22,12 @@ static void delay_ms(uint32_t ms)
 
 static void systick_init(void)
 {
-    SysTick->LOAD = 72000 - 1;   /* 1 мс при 72 МГц */
+    SysTick->LOAD = 72000 - 1;
     SysTick->VAL  = 0;
     SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
     (void)SysTick->CTRL;
 }
 
-/* ---- Blue Pill: HSE 8 МГц -> PLL x9 -> 72 МГц ---- */
 static void clock_init(void)
 {
     RCC->CR |= RCC_CR_HSEON;
@@ -42,30 +53,48 @@ static void clock_init(void)
 
 int main(void)
 {
+    uint16_t level, threshold;
+    uint8_t  playing = 0;
+
     clock_init();
     systick_init();
 
-    /* USART1 на PA9/PA10, шина APB2 = 72 МГц */
-    DF_Init(USART1, 72000000, delay_ms);
+    /* Микрофон на PA0. Калибровка тишины идёт внутри - молчи 2 секунды. */
+    MIC_Init(0);
+    dbg_baseline = MIC_GetBaseline();
+    threshold    = dbg_baseline + TRIGGER_MARGIN;
 
+    /* Плеер на USART1 (PA9/PA10) */
+    DF_Init(USART1, 72000000, delay_ms);
     DF_Reset();
     DF_SetVolume(30);
     DF_SetEQ(DF_EQ_NORMAL);
 
-    DF_PlayTrack(4);
-
     while (1) {
-     
-        DF_PlayTrack(4);
+        /* Ловим ответы модуля */
+        if (DF_Poll()) {
+            if (df_msg.cmd == DF_RSP_FINISHED) {
+                playing = 0;
+                delay_ms(COOLDOWN_MS);
+                /* перекалибровка: AGC мог сдвинуть уровень за время трека */
+                MIC_Calibrate();
+                dbg_baseline = MIC_GetBaseline();
+                threshold    = dbg_baseline + TRIGGER_MARGIN;
+            }
+        }
 
-        delay_ms(8000);
-        DF_PlayTrack(3);
-        delay_ms(8000);
-        DF_PlayTrack(2);
-         delay_ms(8000);
-        DF_PlayTrack(1);
-           delay_ms(8000);
-        
-        
+        /* Пока играет - микрофон не слушаем, иначе сработает от динамика */
+        if (playing) continue;
+
+        level = MIC_ReadLevel();
+        dbg_level = level;
+        if (level > dbg_peak) dbg_peak = level;
+
+        if (level > threshold) {
+            dbg_track = MIC_Random(TRACK_COUNT);
+            DF_PlayTrack(dbg_track);
+            dbg_triggers++;
+            playing = 1;
+        }
     }
 }
