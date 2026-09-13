@@ -1,0 +1,7 @@
+build/
+.vscode/
+.mxproject
+*.o
+*.d
+*.lst
+*.map
